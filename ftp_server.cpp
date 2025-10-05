@@ -4,7 +4,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unordered_map>
-#include <cstring> // memset
+#include <cstring> 
 #include <unistd.h>
 #include <mutex>
 #include <arpa/inet.h>
@@ -16,8 +16,11 @@
 #include <memory>
 #include <utility>
 #include <algorithm>
+
+#define MAX_BUFFER_SIZE 1024
 using namespace std;
 namespace fs = std::filesystem;
+
 class FTPShell
 {
 private:
@@ -32,12 +35,11 @@ public:
             fs::create_directory(home_dir);
         }
         current_dir = home_dir;
-        fs::current_path(home_dir);
     }
     string getCurrentDirectory()
     {
         // relative path
-        string relative = fs::relative(fs::current_path(), home_dir).string();
+        string relative = fs::relative(current_dir, home_dir).string();
         return "/" + (relative == "." ? "" : relative);
     }
     bool changeDirectory(const string &path)
@@ -45,24 +47,38 @@ public:
         fs::path target_path;
         if (path == ".." || path == "../")
         {
+            // both indicates parent directory
             target_path = fs::path(current_dir).parent_path();
         }
         else if (path.empty() || path == "/")
         {
+            // home directory
             target_path = home_dir;
         }
         else if (path[0] == '/')
         {
-            target_path = fs::path(home_dir) / fs::path(path).relative_path();
+            // treat the absolute paths relative to home directory
+            target_path = home_dir + path;
         }
         else
         {
+            // relative path to the current directory
             target_path = fs::path(current_dir) / fs::path(path);
-        }
+        } 
+        try {
+            // security checks
 
-        if (target_path.empty() || !fs::exists(target_path) || !fs::is_directory(target_path) || target_path.string().find(home_dir) == 0)
-        {
-            return false;
+            fs::path canonical_target = fs::weakly_canonical(target_path);
+            if(!fs::exists(canonical_target) || !fs::is_directory(canonical_target)) {
+                return false;
+            }
+
+            string target_str = canonical_target.string(); 
+            if(target_str.rfind(home_dir, 0) != 0) {
+                cerr << "Directory traversal attempt blocked." << endl;
+            }
+        } catch(const fs::filesystem_error& e) {
+            cerr << "[ERROR]: " << e.what() << endl;
         }
         current_dir = target_path.string();
         return true;
@@ -79,12 +95,13 @@ public:
         }
         catch (fs::filesystem_error &e)
         {
-            cerr << "ERROR: " << e.what() << endl;
+            cerr << "[ERROR:] " << e.what() << endl;
         }
         return files;
     }
     bool makeDirectory(const string &dirname)
     {
+        // some bugs
         fs::path new_dir = fs::path(current_dir) / dirname;
         try
         {
@@ -99,6 +116,14 @@ public:
             cerr << "ERROR: " << e.what() << endl;
             return false;
         }
+    }
+    bool removeDirectory(const string &dirname) {
+        fs::path new_path = fs::path(current_dir) / dirname;
+        if(fs::exists(new_path) && fs::is_directory(new_path)) {
+            fs::remove(new_path);
+            return true;
+        }
+        return false;
     }
 };
 class AuthManager
@@ -143,7 +168,9 @@ public:
     {
         if (user_exits(username))
         {
-            return user_db[username] == password;
+            string hashedPassword = user_db[username];
+            return BCrypt::validatePassword(password, hashedPassword);
+
         }
         return false;
     }
@@ -174,51 +201,27 @@ public:
         cout << "User database saved successfully" << endl;
     }
 };
-class ThreadSpawner
-{
-private:
-    thread t;
 
-public:
-    template <typename F, typename... TArgs>
-    ThreadSpawner(F &&operation, TArgs &&...args)
-    {
-        t = thread(forward<F> operation, forward<TArgs>(args)...);
-    }
-    ~ThreadSpawner()
-    {
-        if (t.joinable())
-        {
-            t.join();
-        }
-    }
-    void detach()
-    {
-        if (t.joinable())
-        {
-            t.detach();
-        }
-    }
-    void join()
-    {
-        if (t.joinable())
-        {
-            t.join();
-        }
-    }
-};
+unordered_map<string, string> AuthManager::user_db;
+mutex AuthManager::db_mutex;
+
 
 class EventHandler
 {
+protected:
+    int sock;
 public:
-    virtual void handler(int sock) = 0;
+    EventHandler(int socketId) : sock(socketId){}
+    virtual void handler() = 0;
 };
 
 class ClientHandler : public EventHandler
 {
 public:
-    void handler(int client) override
+    ClientHandler(int socketId) : EventHandler(socketId) {}
+    void handler() override
     {
+        int client = this->sock;
         char buffer[1024];
         memset(buffer, 0, sizeof(buffer));
         string welcome_msg = "220 Welcome to the FTP server\r\n";
@@ -249,31 +252,43 @@ public:
 
             if (command_type == "USER")
             {
-                if(authenticated) {
+                if (authenticated)
+                {
                     response = "230 Already logged in.\r\n";
-                } else if(AuthManager::user_exists(argument)) {
+                }
+                else if (AuthManager::user_exits(argument))
+                {
                     current_user = argument;
                     response = "331 Username OK, need password\r\n";
-                } else {
+                }
+                else
+                {
                     response = "530 Not logged in\r\n";
                 }
-            } else if(command_type == "PASS") {
-                if(current_user.empty()) {
+            }
+            else if (command_type == "PASS")
+            {
+                if (current_user.empty())
+                {
                     response = "503 Bad sequence of commands\r\n";
-                } else if(AuthManager::validate_user(current_user, argument)) {
+                }
+                else if (AuthManager::validate_user(current_user, argument))
+                {
                     authenticated = true;
                     shell = make_unique<FTPShell>("./" + current_user);
                     response = "230 User logged in\r\n";
-                } else {
+                }
+                else
+                {
                     response = "530 Not logged in\r\n";
                     current_user = "";
                 }
             }
-            else if (command.substr(0, 4) == "PASS")
+            else if (command_type == "PASS")
             {
                 response = "230 User logged in\r\n";
             }
-            else if (command.substr(0, 4) == "QUIT")
+            else if (command_type == "QUIT")
             {
                 response = "221 Goodbye\r\n";
                 send(client, response.c_str(), response.length(), 0);
@@ -281,10 +296,78 @@ public:
                 close(client);
                 break;
             }
+            else if (authenticated)
+            {
+
+                if (command_type == "PWD")
+                {
+                    response = "257 \"" + shell->getCurrentDirectory() + "\" is the current directory.\r\n";
+                }
+                else if (command_type == "CWD")
+                {
+                    if (shell->changeDirectory(argument))
+                    {
+                        response = "250 Directory successfully changed.\r\n";
+                    }
+                    else
+                    {
+                        response = "550 Failed to change directory.\r\n";
+                    }
+                }
+                else if (command_type == "CDUP")
+                {
+                    if (shell->changeDirectory(".."))
+                    {
+                        response = "200 Directory successfully changed.\r\n";
+                    }
+                    else
+                    {
+                        response = "550 Failed to change directory.\r\n";
+                    }
+                }
+                else if (command_type == "MKD")
+                {
+                    if (shell->makeDirectory(argument))
+                    {
+                        response = "257 Directory created.\r\n";
+                    }
+                    else
+                    {
+                        response = "550 Failed to create directory. \r\n";
+                    }
+                }
+                else if (command_type == "LIST")
+                {
+                    vector<string> files = shell->listFiles();
+                    stringstream ss;
+                    ss << "226 List follows (" << files.size() << " items):\r\n";
+                    for (const auto &file : files)
+                    {
+                        ss << file << "\r\n";
+                    }
+                    ss << "226 Transfer complete.\r\n";
+                    response = ss.str();
+                } else if(command_type == "RMD") {
+                    if(shell->removeDirectory(argument)) {
+                        response = "250 Directory removed.\r\n";
+                    } else {
+                        response = "550 Failed to remove directory.\r\n";
+                    }
+                }
+            }
+            else
+            {
+                response = "502 Command not implemented.\r\n";
+            }
             send(client, response.c_str(), response.length(), 0);
         }
     }
 };
+
+void client_thread_function(unique_ptr<ClientHandler> client_handler) {
+    client_handler->handler();
+}
+
 class SocketServer
 {
 private:
@@ -322,6 +405,7 @@ public:
             cerr << "ERROR on listening" << endl;
             return;
         }
+
     }
     void accept_connection()
     {
@@ -334,15 +418,26 @@ public:
             return;
         }
         cout << "Client connected" << endl;
-        ClientHandler client;
-
-        // ThreadSpawner t1(client.handler(), clientfd); 
-        t1.detach();
+        auto client_handler_ptr = make_unique<ClientHandler>(clientfd);
+        thread client_thread(client_thread_function, move(client_handler_ptr));
+        client_thread.detach();
     }
 };
 
-int main() {
-    if(!AuthManager::user_exits("admin")) {
+int main()
+{
+    if (!AuthManager::user_exits("admin"))
+    {
         AuthManager::add_user("admin", "admin123");
+        AuthManager::add_user("user", "1234");
     }
+
+    SocketServer server(2121);
+    server.setup();
+    cout << "FTP Server running at PORT 2121" << endl;
+    while (true)
+    {
+        server.accept_connection();
+    }
+    
 }

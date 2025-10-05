@@ -1,0 +1,20 @@
+{
+    "editor.inlineSuggest.enabled": true,
+    "editor.quickSuggestions": {
+        "other": true,
+        "comments": false,
+        "strings": true
+    },
+    "github.copilot.enable": {
+        "*": true
+    },
+    "github.copilot.inlineSuggest.enable": true,
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.autocomplete": "default",
+    "files.exclude": {
+        "**/build": true
+    }
+}
+{
+    "cmake.sourceDirectory": "/home/sree/socket_programming/FTP Server /libbcrypt"
+}
